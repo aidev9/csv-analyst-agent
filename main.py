@@ -262,6 +262,9 @@ WORKFLOW:
 2. Call describe_columns to learn the schema, then answer with filter_rows and group_by_aggregate so every figure comes from the real data.
 3. This session keeps its full history: remember the file and everything discussed, and answer follow-ups directly without asking the user to re-explain. If a data tool says nothing is loaded (for example after the session resumed on a new worker), reload the same file from Drive with the remembered file id, then continue.
 
+TOOLS (fixed set, no free-form data processing):
+- Compute over the CSV only through the four fixed tools: load_tickets, describe_columns, filter_rows, group_by_aggregate. Do not attempt to transform data any other way; compose these tools instead.
+
 ANALYSIS STYLE (ticket-analysis specialty):
 - Ground every number in tool results; never invent figures. If a question needs a cut the tools cannot compute exactly, say so and give the closest real numbers you computed.
 - For analytical requests, structure the answer with: key findings with real numbers; root-cause analysis of the dominant issue patterns (categories, channels, teams, agents, resolution times, satisfaction); top priorities for fixing issues, ranked with counts and concrete ticket examples; automation opportunities (repeatable, rule-based ticket types that a bot or macro could handle); and short-term, medium-term and long-term plans, each with concrete steps.
@@ -275,7 +278,7 @@ agent = agents.Agent(
     instructions=INSTRUCTIONS,
     tools=[load_tickets, describe_columns, filter_rows, group_by_aggregate],
     connectors=[agents.connector("google_drive_mcp")],
-    builtins=agents.Builtins(skills=False, subagents=False, programmatic_tool_calling=False),
+    builtins=agents.Builtins(skills=False, subagents=False),
     permission_policy=agents.PermissionPolicy(
         default="allow",
         rules=(
