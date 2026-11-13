@@ -1,0 +1,11 @@
+[project]
+name = "csv-analyst"
+version = "0.1.0"
+description = "CSV Analyst: a conversational ticket-analysis agent over data/ams-tickets.csv in Google Drive"
+requires-python = ">=3.12"
+dependencies = [
+    "mistralai-agents>=1.1.2,<1.2",
+]
+
+[tool.mistralai.agents]
+entrypoint = "main:agent"
