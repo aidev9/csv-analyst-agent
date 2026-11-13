@@ -1,6 +1,7 @@
 import base64
 import csv
 import io
+import json
 import re
 from typing import Annotated, Any, Literal
 
@@ -19,9 +20,9 @@ def _get_dataset(ctx: agents.ToolCallbackContext) -> dict[str, Any]:
     dataset = _DATASETS.get(ctx.session.id)
     if dataset is None:
         raise agents.ToolError(
-            "No CSV is loaded in this session. Reload data/ams-tickets.csv from Google Drive "
-            "(search_files, then download_file_content), then call load_tickets with the file id "
-            "and the returned base64 content."
+            "No CSV is loaded in this session. Reload data/ams-tickets.csv from Google Drive: "
+            "search_files, then download_file_content with its file id. The download loads the "
+            "dataset automatically."
         )
     return dataset
 
@@ -49,39 +50,133 @@ def _coerce_filter_value(kind: str, value: str) -> Any:
     return value
 
 
-@agents.tool(
-    model_access="direct",
-    annotations=agents.ToolAnnotations(read_only_hint=True),
-)
-async def load_tickets(
-    ctx: agents.ToolCallbackContext,
-    /,
-    file_id: Annotated[str, Field(description="Google Drive file id of ams-tickets.csv, from search_files.")],
-    csv_base64: Annotated[str, Field(description="Base64-encoded CSV content returned by download_file_content for that file id.")],
-) -> dict[str, Any]:
-    """Load the ams-tickets.csv downloaded from Google Drive into this session's dataset. Call this once per session before describe_columns, filter_rows or group_by_aggregate. Returns the row count and column names."""
-    try:
-        text = base64.b64decode(csv_base64).decode("utf-8-sig")
-    except Exception:
-        raise agents.ToolError("csv_base64 is not valid base64-encoded UTF-8 CSV text.")
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
+
+
+def _decode_file_payload(payload: str) -> str:
+    """Return CSV text from a connector payload that is either base64 (optionally a data: URI) or raw text."""
+    value = payload.strip()
+    if value.startswith("data:") and "," in value:
+        value = value.split(",", 1)[1]
+    compact = "".join(value.split())
+    if compact and _BASE64_RE.match(compact):
+        try:
+            padded = compact + "=" * (-len(compact) % 4)
+            altchars = b"-_" if ("-" in compact or "_" in compact) else None
+            return base64.b64decode(padded, altchars=altchars, validate=True).decode("utf-8-sig")
+        except (ValueError, UnicodeDecodeError):
+            pass
+    return value.lstrip("\ufeff")
+
+
+def _longest_string(value: Any) -> str | None:
+    """The longest string inside a JSON value: the file content in a JSON-wrapped connector result."""
+    if isinstance(value, str):
+        return value
+    children: list[Any] = []
+    if isinstance(value, dict):
+        children = list(value.values())
+    elif isinstance(value, list):
+        children = value
+    best: str | None = None
+    for child in children:
+        found = _longest_string(child)
+        if found is not None and (best is None or len(found) > len(best)):
+            best = found
+    return best
+
+
+def _file_payload(result: agents.ToolResult) -> str | None:
+    """Find the file content in a download_file_content result, whatever block shape the connector used."""
+    candidates: list[str] = []
+    for block in result.content:
+        blob = getattr(block, "blob", None)
+        text = getattr(block, "text", None)
+        if blob:
+            candidates.append(blob)
+        elif text:
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                candidates.append(text)
+            else:
+                found = _longest_string(parsed)
+                if found:
+                    candidates.append(found)
+    if result.structured_content is not None:
+        found = _longest_string(result.structured_content)
+        if found:
+            candidates.append(found)
+    return max(candidates, key=len) if candidates else None
+
+
+def _parse_csv(text: str) -> tuple[list[str], list[dict[str, str]]]:
     reader = csv.DictReader(io.StringIO(text))
     columns = list(reader.fieldnames or [])
-    if not columns:
-        raise agents.ToolError("The CSV has no header row.")
-    rows = [dict(row) for row in reader]
-    _DATASETS[ctx.session.id] = {
-        "file_id": file_id,
-        "file_title": TICKETS_FILE_TITLE,
-        "columns": columns,
-        "rows": rows,
-    }
-    return {
-        "status": "loaded",
-        "file_id": file_id,
-        "file_title": TICKETS_FILE_TITLE,
-        "row_count": len(rows),
-        "columns": columns,
-    }
+    return columns, [dict(row) for row in reader]
+
+
+def _is_drive_download(call: Any) -> bool:
+    names = f"{call.tool_id} {call.tool_name}"
+    return "google_drive" in names and call.tool_name.endswith("download_file_content")
+
+
+def _text_result(payload: dict[str, Any], *, is_error: bool = False) -> agents.ToolResult:
+    return agents.ToolResult(content=[agents.TextContentBlock(text=json.dumps(payload))], is_error=is_error)
+
+
+class DriveTicketsLoader(agents.Hook):
+    """Loads the CSV straight from the Drive connector's download into this session's dataset.
+
+    The model never sees or re-sends the file content: it gets a short summary instead. Echoing
+    the base64 content back as a tool argument made the model write the whole file, which could
+    stall the call for minutes.
+    """
+
+    async def post_tool_call(
+        self, ctx: agents.HookCallbackContext, result: agents.hook.PostToolCall
+    ) -> agents.hook.PostToolCallHookContinue | None:
+        if not _is_drive_download(result) or result.tool_result.is_error:
+            return None
+        args = result.arguments
+        file_id = str(args.get("file_id") or args.get("fileId") or args.get("id") or "")
+        payload = _file_payload(result.tool_result)
+        columns: list[str] = []
+        rows: list[dict[str, str]] = []
+        if payload:
+            columns, rows = _parse_csv(_decode_file_payload(payload))
+        if len(columns) < 2:
+            block_types = [getattr(b, "type", type(b).__name__) for b in result.tool_result.content]
+            return agents.hook.PostToolCallHookContinue(
+                tool_result=_text_result(
+                    {
+                        "status": "not_loaded",
+                        "file_id": file_id,
+                        "error": "The downloaded content could not be read as a CSV with a header row.",
+                        "result_block_types": block_types,
+                    },
+                    is_error=True,
+                )
+            )
+        _DATASETS[ctx.session.id] = {
+            "file_id": file_id,
+            "file_title": TICKETS_FILE_TITLE,
+            "columns": columns,
+            "rows": rows,
+        }
+        return agents.hook.PostToolCallHookContinue(
+            tool_result=_text_result(
+                {
+                    "status": "loaded",
+                    "file_id": file_id,
+                    "file_title": TICKETS_FILE_TITLE,
+                    "row_count": len(rows),
+                    "columns": columns,
+                    "note": "The file content was loaded into this session's dataset and is not shown here. "
+                    "Use describe_columns, filter_rows and group_by_aggregate to analyze it.",
+                }
+            )
+        )
 
 
 @agents.tool(
@@ -255,7 +350,7 @@ DATA ACCESS (strict):
 - Your only data source is the file data/ams-tickets.csv in the user's Google Drive, reached through the google_drive_mcp connector, which acts as the user.
 - Locate it with search_files using the query: title = 'ams-tickets.csv' and mimeType = 'text/csv'. Use only that file's id.
 - The connector is read-only for you: only ever call its search_files, get_file_metadata and download_file_content tools. Never create, copy, update or delete any Drive file, and never open any other file.
-- To load the dataset into the session: call download_file_content with the file id, then call load_tickets with that file id and the returned base64 content.
+- To load the dataset into the session: call download_file_content with the file id. The download loads the CSV into the session automatically and returns only a summary (row count and columns), not the file content. Never try to pass file content to any tool.
 
 WORKFLOW:
 1. On the first question about the data (or whenever a data tool reports that no CSV is loaded in this session), locate and load data/ams-tickets.csv as described above.
@@ -263,7 +358,7 @@ WORKFLOW:
 3. This session keeps its full history: remember the file and everything discussed, and answer follow-ups directly without asking the user to re-explain. If a data tool says nothing is loaded (for example after the session resumed on a new worker), reload the same file from Drive with the remembered file id, then continue.
 
 TOOLS (fixed set, no free-form data processing):
-- Compute over the CSV only through the four fixed tools: load_tickets, describe_columns, filter_rows, group_by_aggregate. Do not attempt to transform data any other way; compose these tools instead.
+- Compute over the CSV only through the three fixed tools: describe_columns, filter_rows, group_by_aggregate. Do not attempt to transform data any other way; compose these tools instead.
 
 ANALYSIS STYLE (ticket-analysis specialty):
 - Ground every number in tool results; never invent figures. If a question needs a cut the tools cannot compute exactly, say so and give the closest real numbers you computed.
@@ -276,7 +371,8 @@ agent = agents.Agent(
     name="csv-analyst",
     description="Conversational analyst for the ams-tickets.csv support-ticket dataset in Google Drive: root causes, priorities, automation opportunities and plans, with real numbers.",
     instructions=INSTRUCTIONS,
-    tools=[load_tickets, describe_columns, filter_rows, group_by_aggregate],
+    tools=[describe_columns, filter_rows, group_by_aggregate],
+    hooks=[DriveTicketsLoader()],
     connectors=[agents.connector("google_drive_mcp")],
     builtins=agents.Builtins(skills=False, subagents=False),
     permission_policy=agents.PermissionPolicy(

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import sys
 from pathlib import Path
 
@@ -21,14 +22,76 @@ CSV = (
 )
 
 
+def _download_call(result: agents.ToolResult, tool_id: str = "connector_google_drive_mcp.download_file_content") -> agents.hook.PostToolCall:
+    return agents.hook.PostToolCall(
+        turn_id="local",
+        tool_name=tool_id.rsplit(".", 1)[-1],
+        tool_id=tool_id,
+        tool_call_id="call-1",
+        arguments={"file_id": "file-1"},
+        tool_result=result,
+    )
+
+
+def _hook_ctx(session_id: str = "local") -> agents.HookCallbackContext:
+    return agents.HookCallbackContext(agents.CallbackSession(id=session_id, turn_id="local"))
+
+
+async def _load(result: agents.ToolResult, session_id: str = "local") -> dict:
+    main._DATASETS.pop(session_id, None)
+    out = await main.DriveTicketsLoader().post_tool_call(_hook_ctx(session_id), _download_call(result))
+    assert out is not None
+    return json.loads(out.tool_result.content[0].text)
+
+
+def test_hook_loads_every_payload_shape() -> None:
+    b64 = base64.b64encode(CSV.encode()).decode()
+    shapes = {
+        "embedded blob": agents.ToolResult(
+            content=[agents.EmbeddedResourceContentBlock(uri="gdrive:///file-1", media_type="text/csv", blob=b64)]
+        ),
+        "embedded text": agents.ToolResult(
+            content=[agents.EmbeddedResourceContentBlock(uri="gdrive:///file-1", media_type="text/csv", text=CSV)]
+        ),
+        "text base64": agents.ToolResult(content=[agents.TextContentBlock(text=b64)]),
+        "text raw csv": agents.ToolResult(content=[agents.TextContentBlock(text=CSV)]),
+        "text json": agents.ToolResult(
+            content=[agents.TextContentBlock(text=json.dumps({"file_id": "file-1", "mimeType": "text/csv", "content": b64}))]
+        ),
+        "structured": agents.ToolResult(structured_content={"file": {"name": "ams-tickets.csv", "data": b64}}),
+    }
+
+    async def run() -> None:
+        for label, result in shapes.items():
+            summary = await _load(result)
+            assert summary["status"] == "loaded", label
+            assert summary["row_count"] == 3, label
+            assert "category" in summary["columns"], label
+            assert b64 not in json.dumps(summary) and "Wrong item shipped" not in json.dumps(summary), label
+
+        bad = await main.DriveTicketsLoader().post_tool_call(
+            _hook_ctx("bad"), _download_call(agents.ToolResult(content=[agents.TextContentBlock(text="not a csv")]))
+        )
+        assert bad is not None and bad.tool_result.is_error
+        assert "bad" not in main._DATASETS
+
+        other = await main.DriveTicketsLoader().post_tool_call(
+            _hook_ctx("other"),
+            _download_call(agents.ToolResult(content=[agents.TextContentBlock(text=CSV)]), tool_id="connector_google_drive_mcp.search_files"),
+        )
+        assert other is None
+        assert "other" not in main._DATASETS
+
+    asyncio.run(run())
+
+
 def test_tools_end_to_end() -> None:
     async def run() -> None:
         ctx = agents.ToolCallbackContext.local()
         b64 = base64.b64encode(CSV.encode()).decode()
-        loaded = await main.load_tickets(ctx, file_id="file-1", csv_base64=b64)
+        loaded = await _load(agents.ToolResult(content=[agents.TextContentBlock(text=b64)]))
         assert loaded["status"] == "loaded"
         assert loaded["row_count"] == 3
-        assert "category" in loaded["columns"]
 
         columns = await main.describe_columns(ctx)
         by_name = {c["column"]: c for c in columns}
@@ -81,4 +144,6 @@ def test_tools_end_to_end() -> None:
 
 
 if __name__ == "__main__":
+    test_hook_loads_every_payload_shape()
     test_tools_end_to_end()
+    print("ok")

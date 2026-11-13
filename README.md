@@ -5,7 +5,8 @@ A conversational data analyst agent, built with the [Mistral Agents SDK](https:/
 ## What it does
 
 - Reads `data/ams-tickets.csv` through the `google_drive_mcp` connector (as the session user, read-only).
-- Answers questions with real numbers computed by four fixed tools only — `load_tickets`, `describe_columns`, `filter_rows`, `group_by_aggregate`. No arbitrary code execution (programmatic tool calling is disabled).
+- Loads the CSV with a `post_tool_call` hook (`DriveTicketsLoader`): when the connector's `download_file_content` returns, the hook parses the file into the session's dataset and hands the model only a summary. The model never reads or re-sends the raw file, which keeps model calls short.
+- Answers questions with real numbers computed by three fixed tools only — `describe_columns`, `filter_rows`, `group_by_aggregate`. No arbitrary code execution (programmatic tool calling is disabled).
 - Specialized in ticket analysis: root-cause analysis, top fix priorities, automation opportunities, and short/medium/long-term plans.
 - Sessions are durable, so follow-up questions in the same conversation remember the file and the discussion.
 
