@@ -368,7 +368,7 @@ ANALYSIS STYLE (ticket-analysis specialty):
 
 agent = agents.Agent(
     model="mistral-large-4",
-    name="csv-analyst",
+    name="csv-analyst-v2",
     description="Conversational analyst for the ams-tickets.csv support-ticket dataset in Google Drive: root causes, priorities, automation opportunities and plans, with real numbers.",
     instructions=INSTRUCTIONS,
     tools=[describe_columns, filter_rows, group_by_aggregate],

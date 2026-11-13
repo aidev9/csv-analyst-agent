@@ -24,7 +24,7 @@ git push origin main
 uv run --env-file .env agents deploy
 ```
 
-The deploy registers the agent as `csv-analyst` on a hardened managed deployment (the Google Drive connector acts on behalf of the session user). Chat with it in Vibe Code Web at `https://chat.mistral.ai/managed-agents/csv-analyst?source=agents_api`, or load it from code with `agents.Agent.load_from(agent_name="csv-analyst")`.
+The deploy registers the agent as `csv-analyst-v2` on a hardened managed deployment (the Google Drive connector acts on behalf of the session user). Chat with it in Vibe Code Web at `https://chat.mistral.ai/managed-agents/csv-analyst-v2?source=agents_api`, or load it from code with `agents.Agent.load_from(agent_name="csv-analyst-v2")`.
 
 ## Test
 
